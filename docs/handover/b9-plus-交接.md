@@ -161,3 +161,12 @@ B10（pending 只有静态标签、没有进度）**未做**：需要新的协�
 - **文案**：`kb_read` 提示里 `kb_docs` → `kb_list`
 - **代理**（第六轮）：start/stop 移出主线程；`process` 加 @Volatile；pid 文件清理残留内核；
   端口被占时由 Kotlin 探测一个真的空闲端口给出建议；端口输入框改完点开关即生效；日志只读尾部 256KB
+
+## 仓库迁移（2026-11-15 09:45）
+
+- 旧仓库 `mxy3096316568-lgtm/dsh-Go` 是上游的 fork，GitHub 把 fork 的 Actions 停用了；新仓库
+  `mxy3096316568-lgtm/dsh-Go-build` 不是 fork，Actions 正常。
+- 已把旧仓库**完整镜像**（282 个 refs：main、两个分支、24 个标签，含 app/test 全部 golden）推到新仓库；
+  新仓库 main 比旧仓库多两个提交（`16d8ac7`、`ecd945b`，即代理/上传修复）。
+- 旧仓库删除：当前 token 只有 repo+workflow，没有 `delete_repo`，API 返回 403；需要仓库所有者
+  在 GitHub 网页 Settings → Danger Zone 删除，或换一个有 `delete_repo` 的 token。

@@ -102,6 +102,10 @@ class BrowserSession {
   /// page's input refuses a scripted FileList (Android WebView does), instead of a picker.
   String? pendingUploadPath;
 
+  /// Where the last gesture upload touched the page, for the failure reply (a tap that
+  /// landed outside the input is a different bug from one the page ignored).
+  Map<String, Object?>? unsupportedSpot;
+
   List<BrowserTab> get tabs => List<BrowserTab>.unmodifiable(_tabs);
 
   bool get opened => _controller != null && _tabs.isNotEmpty;
@@ -166,13 +170,17 @@ class BrowserSession {
             if (tab != null) tab.url = value;
             if (_loading != null && !_loading!.isCompleted) _loading!.complete();
             try {
-              final mark = await loadErrorMark();
-              final title = mark.isEmpty ? (await created.getTitle() ?? '') : '加载失败';
-              if (tab != null) {
-                tab.title = title;
-                _bumpTabs();
+              // Title and url from the same document, and only when that document is the
+              // page this callback is about: a stale onPageFinished (fired for the page we
+              // just left) used to stamp 「加载失败」 or the previous title onto the new url.
+              final page = await pageInfo();
+              if (page.url.isEmpty || _samePage(page.url, value)) {
+                if (tab != null && (page.title.isNotEmpty || page.error.isNotEmpty)) {
+                  tab.title = page.error.isNotEmpty ? '加载失败' : page.title;
+                  _bumpTabs();
+                }
+                if (page.error.isEmpty) await SiteStore.record(url: value, title: page.title);
               }
-              if (mark.isEmpty) await SiteStore.record(url: value, title: title);
             } catch (_) {}
           },
         ),
@@ -188,15 +196,81 @@ class BrowserSession {
   /// A marker when the page Chrome is showing is an error page (host unreachable,
   /// certificate, DNS…), empty otherwise. Android's error page is not a document
   /// the page itself served, so nothing else can tell them apart.
+  ///
+  /// Shared by [_errorProbe] and [pageInfo]: the same check has to run in the same
+  /// `evaluateJavascript` call as the title, otherwise a stale answer from the page
+  /// being left behind wins the race (that is how a correct url got the old title).
+  static const _errorDetect = '''
+  let err = "";
+  if (String(location.href || "").startsWith("chrome-error")) {
+    err = "chrome-error";
+  } else {
+    const probe = document.body ? String(document.body.innerText || "").slice(0, 600) : "";
+    const found = probe.match(/ERR_[A-Z_]+|网页无法打开|无法访问此网站|This site can.t be reached/);
+    if (found) err = found[0];
+  }
+''';
+
   static const _errorProbe = '''
 (() => {
-  const url = String(location.href || "");
-  if (url.startsWith("chrome-error")) return "chrome-error";
-  const text = document.body ? String(document.body.innerText || "").slice(0, 600) : "";
-  const found = text.match(/ERR_[A-Z_]+|网页无法打开|无法访问此网站|This site can.t be reached/);
-  return found ? found[0] : "";
+$_errorDetect
+  return err;
 })()
 ''';
+
+  /// url, title, error marker and body length, all read from one document in one call.
+  ///
+  /// One call matters: `title` that comes from a separate `getTitle()` can belong to the
+  /// page before the navigation, which is what made `browser_open` report 「加载失败」 for a
+  /// page that had loaded fine.
+  Future<({String url, String title, String error, int textLength})> pageInfo() async {
+    const empty = (url: '', title: '', error: '', textLength: 0);
+    try {
+      final raw = await run('''
+(() => {
+  const url = String(location.href || "");
+  const title = String(document.title || "");
+  const body = document.body ? String(document.body.innerText || "") : "";
+$_errorDetect
+  return { url: url, title: title, error: err, textLength: body.length };
+})()
+''');
+      final text = _stringOf(raw);
+      final decoded = jsonDecode(text);
+      if (decoded is Map) {
+        return (
+          url: decoded['url']?.toString() ?? '',
+          title: decoded['title']?.toString() ?? '',
+          error: decoded['error']?.toString() ?? '',
+          textLength: (decoded['textLength'] as num?)?.toInt() ?? 0,
+        );
+      }
+    } catch (_) {}
+    return empty;
+  }
+
+  /// Same page, ignoring the fragment and a trailing slash: `onPageFinished` can name the
+  /// page slightly differently from `location.href`.
+  static bool _samePage(String a, String b) {
+    String norm(String value) {
+      final hash = value.indexOf('#');
+      var text = hash >= 0 ? value.substring(0, hash) : value;
+      if (text.endsWith('/') && text.length > 8) text = text.substring(0, text.length - 1);
+      return text;
+    }
+
+    return norm(a) == norm(b);
+  }
+
+  /// Doesn't throw, doesn't navigate: re-reads the current tab's title. Called right before
+  /// a reply so the title in it belongs to the url in it.
+  Future<void> refreshTitle() async {
+    final page = await pageInfo();
+    final tab = currentTab;
+    if (tab == null || (page.title.isEmpty && page.error.isEmpty)) return;
+    tab.title = page.error.isNotEmpty ? '加载失败' : page.title;
+    _bumpTabs();
+  }
 
   /// 标签标题: an error page has no title of its own worth showing.
   void markLoadFailed() {
@@ -450,6 +524,8 @@ class BrowserSession {
     seen.add(key);
     const r = e.getBoundingClientRect();
     const item = { tag: e.tagName.toLowerCase(), text: t, path: pathOf(e) };
+    const anchor = e.closest('a[href]');
+    if (anchor) item.link = String(anchor.getAttribute('href') || '').slice(0, 120);
     if (isFile) item.file = true;
     if (e.disabled === true || e.getAttribute('aria-disabled') === 'true') item.disabled = true;
     if (e.checked === true || e.getAttribute('aria-checked') === 'true') item.checked = true;
@@ -666,23 +742,44 @@ class BrowserSession {
       // the page then receives a genuine selection.
       pendingUploadPath = path;
       try {
-        // Where to touch: the input itself, or the label/button that opens it when the input
-        // is hidden behind a styled control. Coordinates are view pixels.
+        // Where to touch: the input itself, or the label/button that opens it when the
+        // input is hidden behind a styled control. Two things used to go wrong here:
+        //   * the page may be zoomed out (desktop layout), so CSS px × devicePixelRatio is
+        //     not the view coordinate — the visual viewport scale is part of the mapping;
+        //   * the geometric centre can land on something that covers the input.
+        // So the point is verified with elementFromPoint inside the page and only turned
+        // into view pixels once it is known to hit the input (or its label).
         final probe = await BrowserApi.runJs(
           this,
           '''
 (() => {
   const el = document.querySelector('[data-dsh-ref="$ref"]');
   if (!el) return "missing";
-  let target = el;
-  let rect = el.getBoundingClientRect();
-  if (rect.width < 2 || rect.height < 2) {
-    target = el.closest('label,button,a,[role=button]') || (el.labels && el.labels[0]) || el.parentElement || el;
-  }
+  const target = (el.getClientRects().length && el.getBoundingClientRect().width >= 2)
+    ? el
+    : (el.closest('label,button,a,[role=button]') || (el.labels && el.labels[0]) || el.parentElement || el);
   target.scrollIntoView({ block: 'center', inline: 'center' });
-  rect = target.getBoundingClientRect();
+  const hit = (node) => node === el || el.contains(node) || node === target || target.contains(node)
+    || (target.tagName === 'LABEL' && target.control === el);
+  const rect = target.getBoundingClientRect();
   if (rect.width < 2 || rect.height < 2) return "no_target";
-  return { x: (rect.left + rect.width / 2) * devicePixelRatio, y: (rect.top + rect.height / 2) * devicePixelRatio };
+  const scale = (window.visualViewport && window.visualViewport.scale) || 1;
+  const points = [
+    [rect.left + rect.width / 2, rect.top + rect.height / 2],
+    [rect.left + Math.min(rect.width - 2, 8), rect.top + rect.height / 2],
+    [rect.left + rect.width / 2, rect.top + Math.min(rect.height - 2, 8)],
+    [rect.right - 3, rect.bottom - 3],
+  ];
+  for (const [x, y] of points) {
+    const found = document.elementFromPoint(x, y);
+    if (found && hit(found)) {
+      return { x: x * devicePixelRatio * scale, y: y * devicePixelRatio * scale, scale: scale };
+    }
+  }
+  // Nothing verified: still try the centre, and let the caller report what came back.
+  return { x: (rect.left + rect.width / 2) * devicePixelRatio * scale,
+           y: (rect.top + rect.height / 2) * devicePixelRatio * scale,
+           scale: scale, unverified: true };
 })()
 ''',
           5000,
@@ -694,14 +791,18 @@ class BrowserSession {
         if (spot is Map) {
           final x = (spot['x'] as num?)?.toDouble() ?? 0;
           final y = (spot['y'] as num?)?.toDouble() ?? 0;
-          await tapAt(x, y);
-          final deadline = DateTime.now().add(const Duration(milliseconds: 2500));
-          while (pendingUploadPath != null && DateTime.now().isBefore(deadline)) {
-            await Future<void>.delayed(const Duration(milliseconds: 100));
+          // Two attempts: a tap can be swallowed while the page is still settling.
+          for (var attempt = 0; attempt < 2 && pendingUploadPath != null; attempt++) {
+            await tapAt(x, y);
+            final deadline = DateTime.now().add(const Duration(milliseconds: 3000));
+            while (pendingUploadPath != null && DateTime.now().isBefore(deadline)) {
+              await Future<void>.delayed(const Duration(milliseconds: 100));
+            }
           }
           if (pendingUploadPath == null) {
             return {'ok': true, 'path': path, 'name': name, 'bytes': bytes.length, 'files': 1, 'via': 'gesture'};
           }
+          unsupportedSpot = {'x': x, 'y': y, 'scale': spot['scale'], 'unverified': spot['unverified'] == true};
         }
       } finally {
         pendingUploadPath = null;
@@ -715,62 +816,39 @@ class BrowserSession {
         'assigned': 0,
         'visible': pageVisible,
         'url': url.value,
+        if (unsupportedSpot != null) 'tap': unsupportedSpot,
       };
     }
-    // A page may fill `input.files` from its own change handler, a frame or a re-render
-    // later. Ask again for up to two seconds instead of judging one snapshot: a false
-    // failure here makes the model upload the same file over and over.
-    final probeScript = '''
+    // One look, 600 ms later: enough for a page that re-renders its input in the change
+    // handler, short enough that a real failure is reported as one. (There used to be a
+    // ten-round poll that also hunted for the File in other inputs; every extra guess was
+    // another way to report success for something that had not happened.)
+    await Future<void>.delayed(const Duration(milliseconds: 600));
+    final probe = await BrowserApi.runJs(
+      this,
+      '''
 (() => {
   const el = document.querySelector('[data-dsh-ref="$ref"]');
   const target = window.__dshUpTarget;
-  if (!el) return { state: "missing", detached: !!(target && target.isConnected === false) };
+  if (!el) return { state: target && target.isConnected === false ? "gone" : "missing" };
   if (String(el.tagName || "").toLowerCase() !== "input" || String(el.type || "").toLowerCase() !== "file") return { state: "not_file" };
   const files = el.files;
-  // A component may move the File into a fresh input it created: look for it.
-  let moved = 0;
-  if (!files || files.length === 0) {
-    for (const other of document.querySelectorAll('input[type=file]')) {
-      if (other !== el && other.files && other.files.length > 0) { moved = other.files.length; break; }
-    }
-  }
-  return { state: "ok", count: files ? files.length : 0, moved, name: files && files[0] ? files[0].name : "" };
+  return { state: "ok", count: files ? files.length : 0 };
 })()
-''';
-    var count = 0;
-    var replaced = false;
-    for (var attempt = 0; attempt < 10; attempt++) {
-      if (attempt > 0) await Future<void>.delayed(const Duration(milliseconds: 200));
-      final probe = await BrowserApi.runJs(this, probeScript, 5000);
-      final value = probe is Map ? probe['result'] : null;
-      if (value is! Map) continue;
-      final state = value['state'];
-      if (state == 'missing') {
-        if (value['detached'] == true) {
-          // The page replaced its input: it took the file and rebuilt the control.
-          replaced = true;
-          count = (value['count'] as num?)?.toInt() ?? 1;
-          if (count < 1) count = 1;
-          break;
-        }
-        return {'error': 'not_found', 'message': '这个编号不存在，请重新 snapshot'};
-      }
-      if (state == 'not_file') {
-        return {'error': 'unsupported', 'message': '这个编号不是文件选择框（<input type=file>）'};
-      }
-      final picked = (value['count'] as num?)?.toInt() ?? 0;
-      if (picked >= 1) {
-        count = picked;
-        break;
-      }
-      final moved = (value['moved'] as num?)?.toInt() ?? 0;
-      if (moved >= 1) {
-        // The page took it and put it in another input of its own.
-        replaced = true;
-        count = moved;
-        break;
-      }
+''',
+      5000,
+    );
+    final value = probe is Map ? probe['result'] : null;
+    final state = value is Map ? '${value['state']}' : '';
+    if (state == 'missing') {
+      return {'error': 'not_found', 'message': '这个编号不存在，请重新 snapshot'};
     }
+    if (state == 'not_file') {
+      return {'error': 'unsupported', 'message': '这个编号不是文件选择框（<input type=file>）'};
+    }
+    var count = value is Map ? (value['count'] as num?)?.toInt() ?? 0 : 0;
+    var replaced = state == 'gone';
+    if (replaced && count < 1) count = 1;
     if (count >= 1) {
       return {
         'ok': true,
@@ -783,7 +861,7 @@ class BrowserSession {
     }
     return {
       'error': 'unsupported',
-      'message': '页面没有接受这个文件（等了 2 秒，选择框还是空的）。'
+      'message': '页面没有接受这个文件（选择框还是空的）。'
           '如果页面上已经显示了文件或开始上传，就不用重试；否则重新 snapshot 再传一次。',
       'files': 0,
       // Diagnostics for the next report: did anything reach the page at all?
@@ -981,29 +1059,56 @@ class BrowserApi {
         final target = checked.url!;
         try {
           final finalUrl = await session.open(target);
+          // The page's own answer, in one read: 10 s is only how long we were willing to
+          // wait, not whether the page works. An ad-heavy result page keeps requests open
+          // forever and was reported as a failure while it was already readable and clickable.
+          final page = await session.pageInfo();
           if (session.lastLoadTimedOut) {
+            if (page.error.isNotEmpty) {
+              session.markLoadFailed();
+              return {
+                'error': 'load_error',
+                'message': '页面没打开：$target（${page.error}）。网址或网络有问题，读不到这个页面。',
+                'url': target,
+                'finalUrl': finalUrl,
+                'loading': session.loading,
+                'tabs': _tabsOf(session),
+              };
+            }
+            await session.refreshTitle();
+            if (page.textLength >= 20) {
+              return {
+                'ok': true,
+                'url': target,
+                'finalUrl': finalUrl,
+                'loading': session.loading,
+                'warning': '页面已经能读、能点，但有请求（广告/统计）10 秒还没结束，所以没等到「完全加载」。不用重试。',
+                'textLength': page.textLength,
+                'tabs': _tabsOf(session),
+              };
+            }
             session.markLoadFailed();
             return {
               'error': 'load_timeout',
-              'message': '页面 10 秒内没加载完（网络不通、站点太慢，或被代理挡住），现在可能是空白页。检查网络后重试。',
+              'message': '10 秒内既没加载完，页面也没有可读的文字（网络不通、站点太慢，或被代理挡住）。检查网络后重试。',
               'url': target,
               'finalUrl': finalUrl,
               'loading': session.loading,
               'tabs': _tabsOf(session),
             };
           }
-          final mark = await session.loadErrorMark();
-          if (mark.isNotEmpty) {
+          if (page.error.isNotEmpty) {
             session.markLoadFailed();
             return {
               'error': 'load_error',
-              'message': '页面没打开：$target（$mark）。网址或网络有问题，读不到这个页面。',
+              'message': '页面没打开：$target（${page.error}）。网址或网络有问题，读不到这个页面。',
               'url': target,
               'finalUrl': finalUrl,
               'loading': session.loading,
               'tabs': _tabsOf(session),
             };
           }
+          await session.refreshTitle();
           return {
             'ok': true,
             'url': target,
@@ -1121,22 +1226,48 @@ class BrowserApi {
         final checked = _refOf(session, body['ref']);
         if (checked.error != null) return checked.error!;
         final ref = checked.ref!;
-        final raw = await session.run(
-          '(() => { const e = document.querySelector(\'[data-dsh-ref="$ref"]\'); if (!e) return "missing"; e.click(); return "ok"; })()',
-        );
-        if (BrowserSession._stringOf(raw) == 'missing') {
+        // One script answers both "did the ref exist" and "was that thing clickable at
+        // all": tapping a result card's blank area (or a row of grey text) moves nothing,
+        // and a silent ok made that look like a broken browser.
+        final raw = await session.run('''
+(() => {
+  const e = document.querySelector('[data-dsh-ref="$ref"]');
+  if (!e) return { state: "missing" };
+  const near = e.closest('a[href],button,[role=button],[onclick],input,select,textarea,label,summary,[tabindex]');
+  const style = getComputedStyle(e);
+  const clickable = !!near || style.cursor === 'pointer';
+  const label = String((e.innerText || e.value || e.getAttribute('aria-label') || '')).trim().slice(0, 40);
+  e.click();
+  return { state: "ok", clickable: clickable, tag: e.tagName.toLowerCase(), label: label };
+})()
+''');
+        final answer = BrowserSession._stringOf(raw);
+        Map<String, Object?>? hit;
+        try {
+          final decoded = jsonDecode(answer);
+          if (decoded is Map) hit = Map<String, Object?>.from(decoded);
+        } catch (_) {}
+        if (hit == null) {
+          return {'error': 'stale_ref', 'message': '这个编号不存在或已经过期，重新 browser_snapshot 再点'};
+        }
+        if (hit['state'] == 'missing') {
           return {'error': 'stale_ref', 'message': '这个编号不存在或已经过期，重新 browser_snapshot 再点'};
         }
         // A click that navigates takes a moment to show up; wait a little so a read
         // straight after it is not answered with the previous page.
         await session.waitForNavigation();
         final diff = await session.clickDiff();
+        final clickable = hit['clickable'] == true;
         return {
           'ok': true,
           'url': session.url.value,
           'loading': session.loading,
           'refGeneration': session.refGeneration,
           'tabs': _tabsOf(session),
+          'target': {'tag': hit['tag'], 'text': hit['label'], 'clickable': clickable},
+          if (!clickable)
+            'warning': '这个编号是 <${hit['tag']}>，本身不是链接或按钮，点它不会跳转（手点也没反应是正常的）。'
+                '要打开站内页面，请点带 link 的标题那条链接，或重新 snapshot 找可点的元素。',
           ...diff,
         };
       case '/type':

@@ -36,12 +36,19 @@ async function call(path, body, timeoutMs = 15000) {
 
 const OUT = {
   schema: { type: "object", additionalProperties: true },
-  render: (_args, value) => [
-    {
-      type: "text",
-      text: typeof value?.text === "string" ? value.text : JSON.stringify(value, null, 2),
-    },
-  ],
+  // A blank page answers `text: ""` plus a `message`; showing the empty string alone made
+  // browser_read look like a tool error with no explanation. Only take `text` when it has
+  // content, and otherwise keep the message/note in front of the JSON.
+  render: (_args, value) => {
+    const text = typeof value?.text === "string" ? value.text : null;
+    if (text !== null && text.trim() !== "") return [{ type: "text", text }];
+    const message = typeof value?.message === "string" ? value.message : "";
+    const note = typeof value?.note === "string" ? value.note : "";
+    if (text !== null && message) {
+      return [{ type: "text", text: [message, note].filter(Boolean).join("\n") + "\n" + JSON.stringify(value, null, 2) }];
+    }
+    return [{ type: "text", text: JSON.stringify(value, null, 2) }];
+  },
 };
 
 function tool(spec) {

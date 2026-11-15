@@ -37,7 +37,11 @@ class _ProxyPageState extends State<ProxyPage> {
     final state = ProxyService.state.value;
     _subscription.text = state.subscription;
     _port.text = '${state.port}';
-    ProxyService.refresh();
+    // A kernel can be gone after the app was restarted while the switch stayed on: check
+    // once when the page opens instead of showing a switch that is "on" over nothing.
+    ProxyService.refresh().then((state) {
+      if (state.configured && !state.running) ProxyService.start(quiet: true);
+    });
   }
 
   @override
@@ -137,6 +141,18 @@ class _ProxyPageState extends State<ProxyPage> {
           _phase = null;
         });
       }
+    }
+  }
+
+  Future<void> _test() async {
+    setState(() => _busy = true);
+    _say('测试中…（每个站最多 8 秒）');
+    try {
+      final line = await ProxyService.testProxy();
+      final ok = ProxyService.state.value.lastTest?['ok'] == true;
+      _say(line ?? '测完了', failed: !ok);
+    } finally {
+      if (mounted) setState(() => _busy = false);
     }
   }
 
@@ -279,6 +295,15 @@ class _ProxyPageState extends State<ProxyPage> {
             SettingsSection(
               title: '排查',
               children: [
+                SettingsTile(
+                  key: const ValueKey('proxy-test'),
+                  icon: Icons.network_check,
+                  title: '测试连通性',
+                  subtitle: state.probeLine.isEmpty
+                      ? '从代理端口真发两个请求（Google、维基），确认不是「端口在、出不去」'
+                      : state.probeLine,
+                  onTap: _busy ? null : _test,
+                ),
                 SettingsTile(
                   key: const ValueKey('proxy-log'),
                   icon: Icons.article,

@@ -22,6 +22,9 @@ const Set<String> ownedClashKeys = <String>{
   'external-ui',
   'mode',
   'log-level',
+  // 订阅里的 tun 段是给「有 VPN 权限的客户端」用的：这个 App 不开 VPN，mihomo 照着
+  // 配置去开 /dev/net/tun 只会拿到权限错误。它必须在交给内核前被删掉。
+  'tun',
 };
 
 /// [yaml] 去掉所有 [ownedClashKeys] 后的内容，前面补上本 App 的值。

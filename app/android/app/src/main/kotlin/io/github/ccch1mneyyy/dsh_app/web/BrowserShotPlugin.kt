@@ -83,17 +83,31 @@ class BrowserShotPlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCall
             return
         }
         host.runOnUiThread {
-            val now = SystemClock.uptimeMillis()
-            val down = MotionEvent.obtain(now, now, MotionEvent.ACTION_DOWN, x, y, 0)
-            val up = MotionEvent.obtain(now, now + 60, MotionEvent.ACTION_UP, x, y, 0)
+            // Chrome only treats this as a tap when the view owns the focus and the down/up
+            // are apart in time: two events dispatched in the same frame can be folded into
+            // a scroll guard and dropped, which looks exactly like "the page ignored me".
+            web.requestFocus()
+            val downTime = SystemClock.uptimeMillis()
+            val down = MotionEvent.obtain(downTime, downTime, MotionEvent.ACTION_DOWN, x, y, 0).apply {
+                source = android.view.InputDevice.SOURCE_TOUCHSCREEN
+            }
             try {
                 web.dispatchTouchEvent(down)
-                web.dispatchTouchEvent(up)
             } catch (_: Exception) {
             } finally {
                 down.recycle()
-                up.recycle()
             }
+            web.postDelayed({
+                val up = MotionEvent.obtain(downTime, SystemClock.uptimeMillis(), MotionEvent.ACTION_UP, x, y, 0).apply {
+                    source = android.view.InputDevice.SOURCE_TOUCHSCREEN
+                }
+                try {
+                    web.dispatchTouchEvent(up)
+                } catch (_: Exception) {
+                } finally {
+                    up.recycle()
+                }
+            }, 90)
         }
         result.success(mapOf<String, Any?>("ok" to true))
     }

@@ -10,9 +10,13 @@ import androidx.webkit.ProxyConfig
 import androidx.webkit.ProxyController
 import java.io.File
 import java.io.RandomAccessFile
+import java.net.HttpURLConnection
 import java.net.InetSocketAddress
+import java.net.Proxy
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.URL
+import org.json.JSONObject
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 
@@ -69,6 +73,7 @@ class ProxyPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 runOffMain(context, result) { start(context, port) }
             }
             "stop" -> runOffMain(context, result) { stop(context) }
+            "test" -> runOffMain(context, result) { test(context) }
             "log" -> runOffMain(context, result) { mapOf("lines" to lastLines(logFile(context), 40)) }
             else -> result.notImplemented()
         }
@@ -89,6 +94,10 @@ class ProxyPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             } finally {
                 busy = false
             }
+            try {
+                writeStatusFile(context)
+            } catch (_: Exception) {
+            }
             main.post { result.success(out) }
         }
     }
@@ -100,6 +109,7 @@ class ProxyPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         "kernel" to binary(context).exists(),
         "config" to configFile(context).exists(),
         "error" to lastError,
+        "lastTest" to lastTest,
     )
 
     /** The config on disk, so the Dart side can re-sanitise one written by an older version. */
@@ -165,6 +175,10 @@ class ProxyPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 return status(context) + mapOf("error" to "start_timeout", "log" to lastLines(log, 20))
             }
             setWebViewProxy(context, true)
+            // Prove the kernel is not just listening but actually carrying traffic: "port
+            // open, nothing blocked" was reported as a working proxy while every request
+            // silently fell back to direct (ProxyConfig's addDirect()).
+            worker.execute { probe(context) }
             status(context)
         } catch (error: Exception) {
             process = null
@@ -196,9 +210,12 @@ class ProxyPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         val executor = Executor { command -> command.run() }
         try {
             if (enabled) {
+                // No `addDirect()`: the old fallback turned every request that the dead
+                // kernel did not answer into a direct one, so "proxy on" looked like it
+                // worked while blocked sites failed. Without it a broken proxy fails
+                // loudly — which is the only state worth reporting.
                 val config = ProxyConfig.Builder()
                     .addProxyRule("127.0.0.1:$port")
-                    .addDirect()
                     .build()
                 ProxyController.getInstance().setProxyOverride(config, executor) { webViewProxy = true }
             } else {
@@ -209,6 +226,90 @@ class ProxyPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             // runs and the app's own downloads use it; pages just stay direct.
             webViewProxy = false
             lastError = "WebView 不支持代理设置：${error.message ?: error}"
+        }
+    }
+
+    /**
+     * A real HTTPS request through the local port. A kernel that listens proves nothing:
+     * ProxyConfig falls back to `addDirect()`, so a dead node looks exactly like a working
+     * proxy until a blocked site is opened. Two known-blocked sites answer the question
+     * the person is actually asking.
+     */
+    private fun test(context: Context): Map<String, Any?> {
+        if (!isRunning()) {
+            return status(context) + mapOf(
+                "error" to "not_running",
+                "message" to "内核没在跑，先把开关打开再测",
+            )
+        }
+        val results = listOf("www.google.com", "en.wikipedia.org").map { probeHost(it, 8000) }
+        val ok = results.all { it["ok"] == true }
+        lastTest = mapOf("at" to System.currentTimeMillis(), "ok" to ok, "results" to results)
+        return status(context) + mapOf("ok" to ok, "results" to results)
+    }
+
+    private fun probeHost(host: String, timeoutMs: Int): Map<String, Any?> {
+        val started = System.currentTimeMillis()
+        var connection: HttpURLConnection? = null
+        return try {
+            connection = URL("https://$host/").openConnection(
+                Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", port)),
+            ) as HttpURLConnection
+            connection.connectTimeout = timeoutMs
+            connection.readTimeout = timeoutMs
+            connection.instanceFollowRedirects = true
+            connection.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android) DSH-Go")
+            val code = connection.responseCode
+            mapOf(
+                "host" to host,
+                "ok" to (code in 200..399),
+                "status" to code,
+                "ms" to (System.currentTimeMillis() - started),
+            )
+        } catch (error: Exception) {
+            mapOf(
+                "host" to host,
+                "ok" to false,
+                "error" to (error.message ?: error.javaClass.simpleName),
+                "ms" to (System.currentTimeMillis() - started),
+            )
+        } finally {
+            try {
+                connection?.disconnect()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    /** Background probe after a successful start: never blocks the caller, updates [lastTest]. */
+    private fun probe(context: Context) {
+        try {
+            test(context)
+        } catch (_: Exception) {
+        }
+    }
+
+    /**
+     * Same facts as the page, as a file the terminal side can read
+     * (`/sdcard/Download/DSH-Go/proxy-status.json`). Without it every proxy question needs
+     * a screenshot of the settings page.
+     */
+    private fun writeStatusFile(context: Context) {
+        try {
+            val dir = File("/sdcard/Download/DSH-Go")
+            if (!dir.isDirectory && !dir.mkdirs()) return
+            val report = JSONObject()
+            report.put("at", System.currentTimeMillis())
+            report.put("running", isRunning())
+            report.put("port", port)
+            report.put("webViewProxy", webViewProxy)
+            report.put("kernel", binary(context).exists())
+            report.put("config", configFile(context).exists())
+            report.put("error", lastError ?: JSONObject.NULL)
+            report.put("lastTest", lastTest?.let { JSONObject(it) } ?: JSONObject.NULL)
+            report.put("log", org.json.JSONArray(lastLines(logFile(context), 25)))
+            File(dir, "proxy-status.json").writeText(report.toString(2))
+        } catch (_: Exception) {
         }
     }
 
@@ -347,6 +448,9 @@ class ProxyPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
 
         @Volatile
         private var lastError: String? = null
+
+        @Volatile
+        private var lastTest: Map<String, Any?>? = null
 
         private fun isRunning(): Boolean = process?.isAlive == true
     }

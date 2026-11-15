@@ -20,6 +20,7 @@ class ProxyState {
     this.error,
     this.subscription = '',
     this.hint = '',
+    this.lastTest,
   });
 
   final bool running;
@@ -42,6 +43,13 @@ class ProxyState {
   /// A friendly line for the page, when something failed.
   final String hint;
 
+  /// The last through-proxy probe: `{ok, at, results: [{host, ok, status|error, ms}]}`.
+  /// `running` only says the kernel listens; this says traffic actually gets out.
+  final Map<String, Object?>? lastTest;
+
+  /// 「Google 通（820 ms）· 维基 不通」— empty when nothing was probed yet.
+  String get probeLine => ProxyService._probeSummary(lastTest);
+
   ProxyState copyWith({
     bool? running,
     int? port,
@@ -51,6 +59,7 @@ class ProxyState {
     String? error,
     String? subscription,
     String? hint,
+    Map<String, Object?>? lastTest,
   }) => ProxyState(
     running: running ?? this.running,
     port: port ?? this.port,
@@ -60,6 +69,7 @@ class ProxyState {
     error: error ?? this.error,
     subscription: subscription ?? this.subscription,
     hint: hint ?? this.hint,
+    lastTest: lastTest ?? this.lastTest,
   );
 }
 
@@ -92,6 +102,21 @@ class ProxyService {
     state.value = status.copyWith(subscription: state.value.subscription);
     _applyRoute();
     return state.value;
+  }
+
+  /// Sends two requests through the local port (Google, Wikipedia). The kernel answering on
+  /// its port is not proof: ProxyConfig has a `direct` fallback, so a dead node looks fine
+  /// until a blocked site is opened. This is the check the person actually cares about.
+  static Future<String?> testProxy() async {
+    try {
+      final map = await _channel.invokeMapMethod<String, Object?>('test');
+      final next = _merge(map);
+      state.value = next;
+      if (map?['error'] != null) return next.hint.isEmpty ? '测不了：${map?['error']}' : next.hint;
+      return next.probeLine;
+    } on PlatformException catch (error) {
+      return '测试失败：${error.message ?? error.code}';
+    }
   }
 
   /// Downloads (or takes) a Clash config, saves it, and starts the kernel.
@@ -245,6 +270,7 @@ class ProxyService {
       configured: map['config'] == true,
       error: error,
       hint: _hintFor(map),
+      lastTest: map['lastTest'] is Map ? Map<String, Object?>.from(map['lastTest'] as Map) : state.value.lastTest,
     );
   }
 
@@ -274,9 +300,27 @@ class ProxyService {
         return '内核启动失败：${map['message'] ?? ''}';
       case 'write_failed':
         return '配置写不进 App 目录：${map['message'] ?? ''}';
+      case 'not_running':
+        return '内核没在跑，先把开关打开再测';
       default:
         return '';
     }
+  }
+
+  static String _probeSummary(Map<String, Object?>? test) {
+    if (test == null) return '';
+    final results = test['results'];
+    if (results is! List) return '';
+    final parts = <String>[];
+    for (final item in results) {
+      if (item is! Map) continue;
+      final host = '${item['host'] ?? ''}';
+      final ok = item['ok'] == true;
+      final ms = (item['ms'] as num?)?.toInt();
+      final label = host.contains('google') ? 'Google' : host.contains('wikipedia') ? '维基' : host;
+      parts.add(ok ? '$label 通${ms != null ? '（$ms ms）' : ''}' : '$label 不通');
+    }
+    return parts.join(' · ');
   }
 
   static void _applyRoute() {

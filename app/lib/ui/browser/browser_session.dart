@@ -98,6 +98,10 @@ class BrowserSession {
   /// Set when the person asks for a file the next time a page opens a picker.
   bool confirmUploads = true;
 
+  /// The file the next `onShowFileSelector` must answer with: the tool's upload when the
+  /// page's input refuses a scripted FileList (Android WebView does), instead of a picker.
+  String? pendingUploadPath;
+
   List<BrowserTab> get tabs => List<BrowserTab>.unmodifiable(_tabs);
 
   bool get opened => _controller != null && _tabs.isNotEmpty;
@@ -644,6 +648,41 @@ class BrowserSession {
       // The page read the File and emptied the chooser in its change handler.
       return {'ok': true, 'path': path, 'name': name, 'bytes': bytes.length, 'files': 1, 'consumed': true};
     }
+    if (assigned == 0) {
+      // Android WebView refuses a scripted FileList on `input.files`. Ask the page to open
+      // its own chooser and answer `onShowFileSelector` with this file instead of the picker:
+      // the page then receives a genuine selection.
+      pendingUploadPath = path;
+      try {
+        final clicked = await BrowserApi.runJs(
+          this,
+          '(() => { const e = document.querySelector(\'[data-dsh-ref="$ref"]\'); if (!e) return "missing"; e.click(); return "ok"; })()',
+          5000,
+        );
+        final value = clicked is Map ? clicked['result'] : null;
+        if (value == 'missing') {
+          return {'error': 'not_found', 'message': '这个编号不存在，请重新 snapshot'};
+        }
+        final deadline = DateTime.now().add(const Duration(milliseconds: 2500));
+        while (pendingUploadPath != null && DateTime.now().isBefore(deadline)) {
+          await Future<void>.delayed(const Duration(milliseconds: 100));
+        }
+        if (pendingUploadPath == null) {
+          return {'ok': true, 'path': path, 'name': name, 'bytes': bytes.length, 'files': 1, 'via': 'chooser'};
+        }
+      } finally {
+        pendingUploadPath = null;
+      }
+      return {
+        'error': 'unsupported',
+        'message': '这个 WebView 不接受脚本塞文件，页面也没打开自己的选择框。'
+            '把浏览器面板切到前台再传一次，或在页面上手动点「选择文件」。',
+        'files': 0,
+        'assigned': 0,
+        'visible': pageVisible,
+        'url': url.value,
+      };
+    }
     // A page may fill `input.files` from its own change handler, a frame or a re-render
     // later. Ask again for up to two seconds instead of judging one snapshot: a false
     // failure here makes the model upload the same file over and over.
@@ -745,6 +784,11 @@ class BrowserSession {
   /// The page opened a file input: hand it the file [upload] chose, or ask the
   /// person which one when they tapped the input themselves.
   Future<List<String>> _chooseFiles(FileSelectorParams params) async {
+    final pending = pendingUploadPath;
+    if (pending != null) {
+      pendingUploadPath = null;
+      return [Uri.file(pending).toString()];
+    }
     // Only the person's own tap gets here (a trusted gesture). webview_flutter hands
     // the answer to Chrome as `Uri.parse(path)`, and a bare path has no scheme
     // there: send a file:// URI, which Chrome can open.
@@ -1020,7 +1064,12 @@ class BrowserApi {
           return {'error': 'load_error', 'message': '页面加载失败：$reason'};
         }
         if (text.trim().isEmpty) {
-          return {'ok': true, 'text': '', 'note': '这个页面没有文字（可能是空白页，或者还没加载完）'};
+          return {
+            'ok': true,
+            'text': '',
+            'message': '这个标签页是空白的，没有文字',
+            'note': '可能是新开的空白页，或者还没加载完；先 browser_open 一个网址',
+          };
         }
         return {'ok': true, 'text': text};
       case '/js':
@@ -1130,7 +1179,7 @@ class BrowserApi {
         if (text == null) {
           final docs = await _kb.docs();
           if (!docs.any((item) => item.path == doc)) {
-            return {'error': 'not_found', 'message': '知识库里没有这个文档：$doc。先用 kb_search 或 kb_docs 看有哪些文档'};
+            return {'error': 'not_found', 'message': '知识库里没有这个文档：$doc。先用 kb_search 或 kb_list 看有哪些文档'};
           }
           return {'error': 'not_found', 'message': '这个文档没有第 $chunk 块（块序号从 0 开始），先 kb_search 看命中的块'};
         }

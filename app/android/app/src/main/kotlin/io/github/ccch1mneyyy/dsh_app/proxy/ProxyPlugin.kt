@@ -9,6 +9,7 @@ import io.flutter.plugin.common.MethodChannel
 import androidx.webkit.ProxyConfig
 import androidx.webkit.ProxyController
 import java.io.File
+import java.io.RandomAccessFile
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
@@ -68,7 +69,7 @@ class ProxyPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 runOffMain(context, result) { start(context, port) }
             }
             "stop" -> runOffMain(context, result) { stop(context) }
-            "log" -> result.success(lastLines(logFile(context), 40))
+            "log" -> runOffMain(context, result) { mapOf("lines" to lastLines(logFile(context), 40)) }
             else -> result.notImplemented()
         }
     }
@@ -141,7 +142,8 @@ class ProxyPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         killStaleKernel(context, port)
         if (!portFree(port)) {
             lastError = "端口 $port 已被其他应用占用，请换端口"
-            return status(context) + mapOf("error" to "port_in_use", "port" to port, "message" to lastError)
+            return status(context) + mapOf("error" to "port_in_use", "port" to port,
+                "suggest" to suggestPort(port), "message" to lastError)
         }
         return try {
             val log = logFile(context)
@@ -156,7 +158,8 @@ class ProxyPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 // blaming the subscription.
                 if (portAccepts(port)) {
                     lastError = "端口 $port 已被其他应用占用，请换端口"
-                    return status(context) + mapOf("error" to "port_in_use", "port" to port, "message" to lastError)
+                    return status(context) + mapOf("error" to "port_in_use", "port" to port,
+                        "suggest" to suggestPort(port), "message" to lastError)
                 }
                 lastError = "内核启动超时（20 秒端口没起来）"
                 return status(context) + mapOf("error" to "start_timeout", "log" to lastLines(log, 20))
@@ -247,6 +250,12 @@ class ProxyPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         pidFile.delete()
     }
 
+    /** The first bindable port after [from], so "change the port" can name one. */
+    private fun suggestPort(from: Int): Int {
+        for (candidate in from + 1 until minOf(from + 32, 65536)) if (portFree(candidate)) return candidate
+        return from + 1
+    }
+
     /** Something already answers here: another proxy app, or a leftover kernel. */
     private fun portAccepts(port: Int): Boolean = try {
         Socket().use { socket ->
@@ -306,8 +315,20 @@ class ProxyPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     /** The kernel itself, where the installer unpacked it (executable there). */
     private fun binary(context: Context) = File(context.applicationInfo.nativeLibraryDir, "libmihomo.so")
 
+    /** The tail only: the kernel appends to this file forever, and reading it whole can stall. */
     private fun lastLines(file: File, count: Int): List<String> = try {
-        if (!file.exists()) emptyList() else file.readLines().takeLast(count)
+        if (!file.exists()) {
+            emptyList()
+        } else {
+            RandomAccessFile(file, "r").use { handle ->
+                val length = handle.length()
+                val start = maxOf(0L, length - 256L * 1024L)
+                handle.seek(start)
+                val bytes = ByteArray((length - start).toInt())
+                handle.readFully(bytes)
+                String(bytes, Charsets.UTF_8).lineSequence().filter { it.isNotBlank() }.toList().takeLast(count)
+            }
+        }
     } catch (_: Exception) {
         emptyList()
     }
@@ -315,6 +336,7 @@ class ProxyPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     companion object {
         private const val DEFAULT_PORT = 7890
 
+        @Volatile
         private var process: Process? = null
 
         @Volatile

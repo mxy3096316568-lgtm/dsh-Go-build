@@ -105,6 +105,12 @@ class _ProxyPageState extends State<ProxyPage> {
     _say(on ? '启动中…' : '正在关闭…');
     try {
       if (on) {
+        // The port field is the source of truth on this page: apply it before starting,
+        // otherwise an edited port looked accepted but the kernel still used the old one.
+        final typed = int.tryParse(_port.text.trim());
+        if (typed != null && typed >= 1024 && typed <= 65535 && typed != ProxyService.state.value.port) {
+          await ProxyService.setPort(typed);
+        }
         final next = await ProxyService.start();
         if (!next.running) {
           final reason = next.hint.isEmpty ? '内核没起来，看下面的内核日志' : next.hint;

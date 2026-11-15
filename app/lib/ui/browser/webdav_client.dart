@@ -312,8 +312,20 @@ class WebdavClient {
       // the asked-for props, just as a trailing-slash href.
       final isDir = RegExp(r'<[^>]*collection[^>]*>', caseSensitive: false).hasMatch(block) ||
           path.endsWith('/');
-      final name = _tag(block, 'displayname')?.trim().isNotEmpty == true
-          ? _tag(block, 'displayname')!.trim()
+      // Some servers send a percent-encoded <displayname>: matching a search on it then
+      // hits the hex escapes ("视频" → %E8%A7%86%E9%A2%91 contains "a"), which is exactly
+      // how a one-letter query matched Chinese folders with no "a" in their names.
+      String decodeName(String value) {
+        try {
+          return Uri.decodeFull(value);
+        } catch (_) {
+          return value;
+        }
+      }
+
+      final display = _tag(block, 'displayname')?.trim();
+      final name = display != null && display.isNotEmpty
+          ? decodeName(display)
           : (path == '/' ? '/' : path.split('/').where((s) => s.isNotEmpty).last);
       out.add({
         'name': name,

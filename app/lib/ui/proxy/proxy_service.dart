@@ -179,6 +179,19 @@ class ProxyService {
     }
   }
 
+  /// Applies a new local port without re-importing: saved, and written into the config
+  /// header (the old path only took a port during 「导入并启动」, so editing the field
+  /// and toggling the switch silently kept using the previous port).
+  static Future<void> setPort(int port) async {
+    final chosen = port.clamp(1024, 65535).toInt();
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setInt(_portKey, chosen);
+    } catch (_) {}
+    state.value = state.value.copyWith(port: chosen);
+    await _healConfig();
+  }
+
   static Future<ProxyState> stop() async {
     try {
       final map = await _channel.invokeMapMethod<String, Object?>('stop');
@@ -195,7 +208,9 @@ class ProxyService {
   static Future<String> log() async {
     String kernel;
     try {
-      kernel = (await _channel.invokeListMethod<String>('log') ?? const []).join('\n');
+      final map = await _channel.invokeMapMethod<String, Object?>('log');
+      final lines = map?['lines'];
+      kernel = lines is List ? lines.map((line) => '$line').join('\n') : '';
     } catch (_) {
       kernel = '';
     }
@@ -245,11 +260,14 @@ class ProxyService {
         return '这个安装包里没有代理内核（libmihomo.so），需要重新构建';
       case 'no_config':
         return '还没有导入订阅';
+      case 'port_in_use':
+        final taken = (map['port'] as num?)?.toInt() ?? state.value.port;
+        final suggest = (map['suggest'] as num?)?.toInt();
+        return '端口 $taken 已被其他应用占用，'
+            '${suggest != null ? '可以换成 $suggest' : '请换一个没被占用的端口'}'
+            '（上面「本地端口」改好，再点开关）';
       case 'busy':
         return '上一次启动/停止还没结束，等几秒再看（这次没有重复启动）';
-      case 'port_in_use':
-        final port = (map['port'] as num?)?.toInt();
-        return '端口 ${port ?? state.value.port} 已被其他应用占用，请换端口（上面「本地端口」改成别的，比如 ${((port ?? state.value.port) + 1)}）';
       case 'start_timeout':
         return '内核起来了但 20 秒内端口没就绪，而且端口没有被别的程序占用——可能是订阅配置有问题（看下面的日志）';
       case 'start_failed':

@@ -150,3 +150,14 @@ B10（pending 只有静态标签、没有进度）**未做**：需要新的协�
 - `start` / `stop` 全部移到单线程 worker，结果回到主线程再 `result.success`；界面不再被阻塞
 - 加 `busy` 门：上一次没结束时的第二次点击直接回 `busy`（不重复拉起内核）
 - 停止/启动前读 `<data>/mihomo.pid`：若上一个进程还活着（被强杀后残留）且 cmdline 是 `libmihomo`，先 SIGKILL 再等端口释放 —— 修掉「自己的旧内核占着 7890，下次启动报端口被占」
+
+## 第七轮（09:23 复测）
+
+- **上传**：Android WebView 拒绝脚本写 `input.files`（回包 `assigned:0` 就是它）。
+  改为：先试脚本填入；被拒时调用页面自己的 `input.click()`，由 `onShowFileSelector` 用待传文件作答，
+  页面拿到的是真实选择（`files:1, via:"chooser"`）；页面连选择框都不开时，文案明确说「切前台/手动选」
+- **云盘**：`displayname` 也可能是 percent 编码（`%E8%A7%86…` 里的 `a`），现在先 decode 再比名字
+- **空白页**：`browser_read` 回 `message`「这个标签页是空白的，没有文字」+ note
+- **文案**：`kb_read` 提示里 `kb_docs` → `kb_list`
+- **代理**（第六轮）：start/stop 移出主线程；`process` 加 @Volatile；pid 文件清理残留内核；
+  端口被占时由 Kotlin 探测一个真的空闲端口给出建议；端口输入框改完点开关即生效；日志只读尾部 256KB

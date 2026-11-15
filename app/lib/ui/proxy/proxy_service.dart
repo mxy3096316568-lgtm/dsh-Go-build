@@ -245,6 +245,8 @@ class ProxyService {
         return '这个安装包里没有代理内核（libmihomo.so），需要重新构建';
       case 'no_config':
         return '还没有导入订阅';
+      case 'busy':
+        return '上一次启动/停止还没结束，等几秒再看（这次没有重复启动）';
       case 'port_in_use':
         final port = (map['port'] as num?)?.toInt();
         return '端口 ${port ?? state.value.port} 已被其他应用占用，请换端口（上面「本地端口」改成别的，比如 ${((port ?? state.value.port) + 1)}）';

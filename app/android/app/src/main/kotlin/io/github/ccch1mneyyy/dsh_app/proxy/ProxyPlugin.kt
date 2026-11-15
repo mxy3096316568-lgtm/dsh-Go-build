@@ -1,6 +1,8 @@
 package io.github.ccch1mneyyy.dsh_app.proxy
 
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -11,6 +13,7 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.Executor
+import java.util.concurrent.Executors
 
 /**
  * 内置代理: mihomo as a local mixed-port proxy, for this app only.
@@ -27,6 +30,14 @@ import java.util.concurrent.Executor
 class ProxyPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     private var channel: MethodChannel? = null
     private var app: Context? = null
+
+    // Starting the kernel waits for its port (up to 20 s). On the platform thread that is an
+    // ANR — the whole app freezes when the tap finally succeeds. One worker and one explicit
+    // busy flag keep both a second tap and the UI out of that wait.
+    private val worker = Executors.newSingleThreadExecutor()
+    private val main = Handler(Looper.getMainLooper())
+    @Volatile
+    private var busy = false
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         app = binding.applicationContext
@@ -52,10 +63,32 @@ class ProxyPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 }
             }
             "readConfig" -> result.success(readConfig(context))
-            "start" -> result.success(start(context, call.argument<Number>("port")?.toInt() ?: DEFAULT_PORT))
-            "stop" -> result.success(stop(context))
+            "start" -> {
+                val port = call.argument<Number>("port")?.toInt() ?: DEFAULT_PORT
+                runOffMain(context, result) { start(context, port) }
+            }
+            "stop" -> runOffMain(context, result) { stop(context) }
             "log" -> result.success(lastLines(logFile(context), 40))
             else -> result.notImplemented()
+        }
+    }
+
+    /** Runs [work] on the worker; the reply goes back on the platform thread. */
+    private fun runOffMain(context: Context, result: MethodChannel.Result, work: () -> Map<String, Any?>) {
+        if (busy) {
+            result.success(status(context) + mapOf("error" to "busy", "message" to "上一次启动/停止还没结束，稍等几秒"))
+            return
+        }
+        busy = true
+        worker.execute {
+            val out = try {
+                work()
+            } catch (error: Exception) {
+                status(context) + mapOf("error" to "start_failed", "message" to (error.message ?: error.toString()))
+            } finally {
+                busy = false
+            }
+            main.post { result.success(out) }
         }
     }
 
@@ -103,6 +136,9 @@ class ProxyPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             return status(context) + mapOf("error" to "no_config")
         }
         port = requestedPort.coerceIn(1024, 65535)
+        // A force-closed app leaves its kernel running (it is a separate process). That kernel
+        // then owns the port and every later start reports "port in use" for our own child.
+        killStaleKernel(context, port)
         if (!portFree(port)) {
             lastError = "端口 $port 已被其他应用占用，请换端口"
             return status(context) + mapOf("error" to "port_in_use", "port" to port, "message" to lastError)
@@ -111,6 +147,7 @@ class ProxyPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             val log = logFile(context)
             val started = MihomoProcess.start(binary, dataDir(context), config, log)
             process = started
+            writePid(context, pidOf(started))
             if (!waitForPort(port, 20000)) {
                 started.destroy()
                 process = null
@@ -144,6 +181,7 @@ class ProxyPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             }
         }
         process = null
+        File(dataDir(context), "mihomo.pid").delete()
         // Killing is asynchronous: the page shows 「已关闭」 only once the port can be bound
         // again, otherwise the next start would report the old kernel as a port conflict.
         waitPortFree(port, 3000)
@@ -169,6 +207,44 @@ class ProxyPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             webViewProxy = false
             lastError = "WebView 不支持代理设置：${error.message ?: error}"
         }
+    }
+
+    private fun pidOf(process: Process): Long = try {
+        (Process::class.java.getMethod("pid").invoke(process) as? Long) ?: -1L
+    } catch (_: Exception) {
+        -1L
+    }
+
+    private fun writePid(context: Context, pid: Long) {
+        if (pid <= 0) return
+        try {
+            File(dataDir(context), "mihomo.pid").writeText(pid.toString())
+        } catch (_: Exception) {
+        }
+    }
+
+    /** Best effort: kill the kernel a previous app process left behind, if it still runs. */
+    private fun killStaleKernel(context: Context, port: Int) {
+        val pidFile = File(dataDir(context), "mihomo.pid")
+        val pid = try {
+            if (pidFile.exists()) pidFile.readText().trim().toIntOrNull() ?: -1 else -1
+        } catch (_: Exception) {
+            -1
+        }
+        if (pid <= 0) return
+        val cmdline = try {
+            File("/proc/$pid/cmdline").readText().replace('\u0000', ' ')
+        } catch (_: Exception) {
+            ""
+        }
+        if (cmdline.contains("libmihomo")) {
+            try {
+                android.os.Process.sendSignal(pid, android.os.Process.SIGNAL_KILL)
+            } catch (_: Exception) {
+            }
+            waitPortFree(port, 2000)
+        }
+        pidFile.delete()
     }
 
     /** Something already answers here: another proxy app, or a leftover kernel. */

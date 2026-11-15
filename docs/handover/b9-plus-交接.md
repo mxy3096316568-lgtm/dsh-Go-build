@@ -139,3 +139,14 @@ B10（pending 只有静态标签、没有进度）**未做**：需要新的协�
 
 本地验证：snapshot / diff 两段脚本在 jsdom 里跑过（refs、paging、disabled/checked/section/visible、changed/added/removed）；
 `dart analyze`（app 与 dsh_client）No issues found；桥接 native 98、kit 115、client 32 全过。
+
+## 第六轮（09:15 反馈）：点开关整个界面卡死
+
+**根因**：`ProxyPlugin.start()` 在 **平台主线程** 上等内核端口就绪（最多 20 秒，每 150ms 睡一次）。
+内核真能起来时，这 20 秒就把 UI 线程按死了 → 页面无响应、系统 ANR、只能手动关 App。
+之前没那么明显，是因为配置有重复键时内核秒退，等待立刻返回。
+
+**改法**：
+- `start` / `stop` 全部移到单线程 worker，结果回到主线程再 `result.success`；界面不再被阻塞
+- 加 `busy` 门：上一次没结束时的第二次点击直接回 `busy`（不重复拉起内核）
+- 停止/启动前读 `<data>/mihomo.pid`：若上一个进程还活着（被强杀后残留）且 cmdline 是 `libmihomo`，先 SIGKILL 再等端口释放 —— 修掉「自己的旧内核占着 7890，下次启动报端口被占」

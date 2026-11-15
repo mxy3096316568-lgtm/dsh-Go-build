@@ -207,25 +207,40 @@ class ProxyPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
 
     /** Points WebView at the local port (all WebViews of this app; nothing else). */
     private fun setWebViewProxy(context: Context, enabled: Boolean) {
-        val executor = Executor { command -> command.run() }
-        try {
-            if (enabled) {
-                // No `addDirect()`: the old fallback turned every request that the dead
-                // kernel did not answer into a direct one, so "proxy on" looked like it
-                // worked while blocked sites failed. Without it a broken proxy fails
-                // loudly — which is the only state worth reporting.
-                val config = ProxyConfig.Builder()
-                    .addProxyRule("127.0.0.1:$port")
-                    .build()
-                ProxyController.getInstance().setProxyOverride(config, executor) { webViewProxy = true }
-            } else {
-                ProxyController.getInstance().clearProxyOverride(executor) { webViewProxy = false }
+        // ProxyController is a UI-thread API: called from the worker it throws, the catch
+        // below turns that into "not supported", and WebView quietly keeps going direct —
+        // which is what makes a running kernel look useless. Post it and wait for the
+        // callback, so `webViewProxy` in the reply is the truth.
+        val done = java.util.concurrent.CountDownLatch(1)
+        main.post {
+            try {
+                val executor = Executor { command -> command.run() }
+                if (enabled) {
+                    // No `addDirect()`: the old fallback turned every request the kernel did
+                    // not answer into a direct one, so "proxy on" looked fine while blocked
+                    // sites failed. A broken proxy must fail loudly.
+                    val config = ProxyConfig.Builder()
+                        .addProxyRule("127.0.0.1:$port")
+                        .build()
+                    ProxyController.getInstance().setProxyOverride(config, executor) {
+                        webViewProxy = true
+                        done.countDown()
+                    }
+                } else {
+                    ProxyController.getInstance().clearProxyOverride(executor) {
+                        webViewProxy = false
+                        done.countDown()
+                    }
+                }
+            } catch (error: Exception) {
+                webViewProxy = false
+                lastError = "WebView 不接受代理设置：${error.message ?: error}"
+                done.countDown()
             }
-        } catch (error: Exception) {
-            // WebView without ProxyController support (very old system WebView): the kernel still
-            // runs and the app's own downloads use it; pages just stay direct.
-            webViewProxy = false
-            lastError = "WebView 不支持代理设置：${error.message ?: error}"
+        }
+        try {
+            done.await(3, java.util.concurrent.TimeUnit.SECONDS)
+        } catch (_: InterruptedException) {
         }
     }
 

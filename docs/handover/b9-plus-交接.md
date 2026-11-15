@@ -170,3 +170,13 @@ B10（pending 只有静态标签、没有进度）**未做**：需要新的协�
   新仓库 main 比旧仓库多两个提交（`16d8ac7`、`ecd945b`，即代理/上传修复）。
 - 旧仓库删除：当前 token 只有 repo+workflow，没有 `delete_repo`，API 返回 403；需要仓库所有者
   在 GitHub 网页 Settings → Danger Zone 删除，或换一个有 `delete_repo` 的 token。
+
+## 第八轮（09:55 报告）
+
+- **上传（P1）**：脚本写 `input.files` 被 WebView 拒绝，`element.click()` 又不是用户手势、页面不会开选择框。
+  改成给 WebView 派发**真实触摸**（新通道 `dsh/browser-shot.tap`，坐标取元素 rect 中心 × devicePixelRatio，隐藏 input 改点它的
+  label/按钮）；`onShowFileSelector` 用待传文件作答。失败文案不再提「切前台」，直说这个页面不给选择框。
+- **状态（P4）**：`/state` 顶层 `url` 取当前活动标签的 url，不再读共享 notifier。
+- **空气页（P2）**：`/read` 空白时已回 `message` + `note`；若仍空，需要一条新日志确认是哪条路径。
+- **代理（P3）**：内置代理只接管 App 内 WebView/下载/云盘，**不改系统 DNS**；终端 `getent`/引擎流量仍走系统解析，
+  被污染是预期。页面说明已改成这句话，避免误解。

@@ -291,8 +291,9 @@ class _ProxyPageState extends State<ProxyPage> {
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
               child: Text(
-                '说明：引擎自己连模型服务时用的是系统网络，不受这个代理影响；要让它也走代理，'
-                '需要重启引擎并设置 HTTP_PROXY（后续版本接上）。订阅里的节点选择、规则都由内核按配置执行。',
+                '说明：这个开关只接管 App 内的网页、下载和云盘，不改手机的系统 DNS 和路由；'
+                '引擎自己连模型服务、终端的 curl/getent 都还是系统网络，国外域名被污染时它们照样解析不了。'
+                '订阅里的节点选择、规则由内核按配置执行。',
                 style: theme.textTheme.bodySmall,
               ),
             ),

@@ -3,6 +3,8 @@ package io.github.ccch1mneyyy.dsh_app.web
 import android.app.Activity
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.os.SystemClock
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.WebView
@@ -61,8 +63,39 @@ class BrowserShotPlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCall
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
         when (call.method) {
             "capture" -> capture(call, result)
+            "tap" -> tap(call, result)
             else -> result.notImplemented()
         }
+    }
+
+    /**
+     * A real touch on the page at (x, y) in view pixels. A scripted `element.click()` is not a
+     * user gesture, so a page's file chooser never opens for it; a synthesized touch is one, and
+     * `onShowFileChooser` then answers with the upload tool's file.
+     */
+    private fun tap(call: MethodCall, result: MethodChannel.Result) {
+        val x = call.argument<Number>("x")?.toFloat()
+        val y = call.argument<Number>("y")?.toFloat()
+        val host = activity
+        val web = host?.let { findWebView(it.window.decorView, null) }
+        if (x == null || y == null || web == null) {
+            result.success(mapOf<String, Any?>("error" to "browser_closed", "message" to "浏览器没打开，先 browser_open"))
+            return
+        }
+        host.runOnUiThread {
+            val now = SystemClock.uptimeMillis()
+            val down = MotionEvent.obtain(now, now, MotionEvent.ACTION_DOWN, x, y, 0)
+            val up = MotionEvent.obtain(now, now + 60, MotionEvent.ACTION_UP, x, y, 0)
+            try {
+                web.dispatchTouchEvent(down)
+                web.dispatchTouchEvent(up)
+            } catch (_: Exception) {
+            } finally {
+                down.recycle()
+                up.recycle()
+            }
+        }
+        result.success(mapOf<String, Any?>("ok" to true))
     }
 
     private fun capture(call: MethodCall, result: MethodChannel.Result) {

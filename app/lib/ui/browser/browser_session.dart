@@ -387,6 +387,18 @@ class BrowserSession {
     return {'ok': false, 'error': 'snapshot_failed', 'message': '这个页面取不到元素，稍后重试'};
   }
 
+  /// A real touch on the page at [x], [y] (view pixels). Scripted clicks are not user
+  /// gestures, so a file chooser never opens for them; this one is.
+  Future<bool> tapAt(double x, double y) async {
+    try {
+      final answer = await const MethodChannel('dsh/browser-shot')
+          .invokeMapMethod<String, Object?>('tap', {'x': x, 'y': y});
+      return answer?['ok'] == true;
+    } catch (_) {
+      return false;
+    }
+  }
+
   /// After a tap: what changed since the last snapshot, not the whole page again.
   /// Returns the diff and starts a new ref generation for the changed refs.
   Future<Map<String, Object?>> clickDiff() async {
@@ -654,29 +666,51 @@ class BrowserSession {
       // the page then receives a genuine selection.
       pendingUploadPath = path;
       try {
-        final clicked = await BrowserApi.runJs(
+        // Where to touch: the input itself, or the label/button that opens it when the input
+        // is hidden behind a styled control. Coordinates are view pixels.
+        final probe = await BrowserApi.runJs(
           this,
-          '(() => { const e = document.querySelector(\'[data-dsh-ref="$ref"]\'); if (!e) return "missing"; e.click(); return "ok"; })()',
+          '''
+(() => {
+  const el = document.querySelector('[data-dsh-ref="$ref"]');
+  if (!el) return "missing";
+  let target = el;
+  let rect = el.getBoundingClientRect();
+  if (rect.width < 2 || rect.height < 2) {
+    target = el.closest('label,button,a,[role=button]') || (el.labels && el.labels[0]) || el.parentElement || el;
+  }
+  target.scrollIntoView({ block: 'center', inline: 'center' });
+  rect = target.getBoundingClientRect();
+  if (rect.width < 2 || rect.height < 2) return "no_target";
+  return { x: (rect.left + rect.width / 2) * devicePixelRatio, y: (rect.top + rect.height / 2) * devicePixelRatio };
+})()
+''',
           5000,
         );
-        final value = clicked is Map ? clicked['result'] : null;
-        if (value == 'missing') {
+        final spot = probe is Map ? probe['result'] : null;
+        if (spot == 'missing') {
           return {'error': 'not_found', 'message': '这个编号不存在，请重新 snapshot'};
         }
-        final deadline = DateTime.now().add(const Duration(milliseconds: 2500));
-        while (pendingUploadPath != null && DateTime.now().isBefore(deadline)) {
-          await Future<void>.delayed(const Duration(milliseconds: 100));
-        }
-        if (pendingUploadPath == null) {
-          return {'ok': true, 'path': path, 'name': name, 'bytes': bytes.length, 'files': 1, 'via': 'chooser'};
+        if (spot is Map) {
+          final x = (spot['x'] as num?)?.toDouble() ?? 0;
+          final y = (spot['y'] as num?)?.toDouble() ?? 0;
+          await tapAt(x, y);
+          final deadline = DateTime.now().add(const Duration(milliseconds: 2500));
+          while (pendingUploadPath != null && DateTime.now().isBefore(deadline)) {
+            await Future<void>.delayed(const Duration(milliseconds: 100));
+          }
+          if (pendingUploadPath == null) {
+            return {'ok': true, 'path': path, 'name': name, 'bytes': bytes.length, 'files': 1, 'via': 'gesture'};
+          }
         }
       } finally {
         pendingUploadPath = null;
       }
       return {
         'error': 'unsupported',
-        'message': '这个 WebView 不接受脚本塞文件，页面也没打开自己的选择框。'
-            '把浏览器面板切到前台再传一次，或在页面上手动点「选择文件」。',
+        'message': '没能把文件交给这个页面：WebView 不接受脚本写 input.files，'
+            '模拟点击也没有让它打开文件选择框。可以在浏览器面板里手动选一次文件，'
+            '或对这个页面用 browser_js 走站点自己的上传接口。',
         'files': 0,
         'assigned': 0,
         'visible': pageVisible,
@@ -935,7 +969,7 @@ class BrowserApi {
       case '/state':
         return {
           'open': session.opened,
-          'url': session.url.value,
+          'url': (session.currentTab?.url.isNotEmpty ?? false) ? session.currentTab!.url : session.url.value,
           'visible': session.pageVisible,
           'loading': session.loading,
           'refGeneration': session.refGeneration,
